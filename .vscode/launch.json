@@ -1,16 +1,26 @@
 {
-    // 使用 IntelliSense 了解相关属性。 
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
     
         {
-            "name": "Python 调试程序: 当前文件",
+            "name": "Launch distributed training (master)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal"
+            //"program": "${workspaceFolder}/script/downstream.py",
+            "module": "torch.distributed.launch",
+            "console": "integratedTerminal",
+            "args": [
+                //"-m", "torch.distributed.launch",
+                "--nproc_per_node=1",
+                "${workspaceFolder}/script/downstream.py",
+                "-c", "config.yaml",
+                "--gpus", "[0]"
+            ],
+  
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
         }
     ]
 }
+  
