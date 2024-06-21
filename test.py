@@ -64,8 +64,7 @@ class Engine(core.Configurable):
         if hasattr(task, "preprocess"):
             if self.rank == 0:
                 module.logger.warning("Preprocess training set")
-            # TODO: more elegant implementation
-            # handle dynamic parameters in optimizer
+            
             old_params = list(task.parameters())
             result = task.preprocess(train_set, valid_set, test_set)
             if result is not None:

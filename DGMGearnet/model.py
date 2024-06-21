@@ -115,6 +115,8 @@ class DGMGeometryAwareRelationalGraphNeuralNetwork(nn.Module, core.Configurable)
         else:
             node_feature = hiddens[-1]
         graph_feature = self.readout(graph, node_feature)
+        
+        print("graph_feature", graph_feature.shape)
 
         return {
             "graph_feature": graph_feature,

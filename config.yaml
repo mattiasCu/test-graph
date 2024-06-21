@@ -15,7 +15,7 @@ task:
   model:
     class: DGMGearNet
     input_dim: 21
-    hidden_dims: [512, 512, 512, 512, 512, 512]
+    hidden_dims: [512, 512, 512]
     batch_norm: True
     concat_hidden: True
     short_cut: True

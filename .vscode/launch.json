@@ -11,10 +11,10 @@
             "console": "integratedTerminal",
             "args": [
                 //"-m", "torch.distributed.launch",
-                "--nproc_per_node=1",
+                "--nproc_per_node=2",
                 "${workspaceFolder}/script/downstream.py",
                 "-c", "config.yaml",
-                "--gpus", "[0]"
+                "--gpus", "[0,1]"
             ],
   
             "env": {

@@ -38,6 +38,7 @@ class relationalGraph(layers. MessagePassingBase):
             self.edge_linear = None
 
     def message_and_aggregate(self, graph, input, edge_list, edge_weight):
+        device = input.device  # 获取设备
         assert graph.num_relation == self.num_relation
 
         if edge_list is None:
@@ -47,13 +48,13 @@ class relationalGraph(layers. MessagePassingBase):
         node_out = node_out * self.num_relation + relation
         if edge_weight is None:
             degree_out = scatter_add(graph.edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
-            edge_weight = graph.edge_weight / degree_out[node_out]
+            edge_weight = graph.edge_weight / (degree_out[node_out]+self.eps)
         else:
             degree_out = scatter_add(edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
-            edge_weight = edge_weight / degree_out[node_out]
+            edge_weight = edge_weight / (degree_out[node_out]+self.eps)
         adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation))
-        update = torch.sparse.mm(adjacency.t(), input)
+                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
+        update = torch.sparse.mm(adjacency.t(), input.to(device))
         
         if self.edge_linear:
             edge_input = graph.edge_feature.float()
@@ -96,11 +97,14 @@ class MultiHeadSelfAttention(nn.Module):
         self.query = nn.Linear(in_features, out_features * num_heads)
         self.key = nn.Linear(in_features, out_features * num_heads)
         self.value = nn.Linear(in_features, out_features * num_heads)
-        self.scale = torch.sqrt(torch.FloatTensor([out_features]))
+        self.scale = torch.sqrt(torch.FloatTensor([out_features])).to(torch.device('cuda'))
         
 
     def forward(self, node_features, graph):
         num_nodes = node_features.size(0)
+        device = node_features.device 
+        
+        self.scale = self.scale.to(device)
 
         # 计算查询、键和值，并为多头自注意力进行变形
         Q = self.query(node_features).view(num_nodes, self.num_heads, self.out_features)  # [num_nodes, num_heads, out_features]
@@ -130,7 +134,7 @@ class Combinedlayer(nn.Module):
     eps = 1e-10
     
     def __init__(self, input_dim, output_dim, num_relation, edge_input_dim, 
-                 num_heads, attention_out_features, temperature=0.5, dropout=0.1):
+                 num_heads = 8, attention_out_features = 64, temperature=0.5, dropout=0.1):
         super(Combinedlayer, self).__init__()
         
         self.relational_graph = relationalGraph(input_dim, output_dim, num_relation, edge_input_dim)
@@ -232,7 +236,7 @@ class Combinedlayer(nn.Module):
         new_edge_weight = self.normalize_edge_weights(new_edge_weight)
         
         # 调试信息
-        print("new_edge_list: ", new_edge_list)
+        #print("new_edge_list: ", new_edge_list)
         print("new_edge_weight: ", new_edge_weight)
         
         
@@ -262,6 +266,7 @@ class rewireGeometricRelationalGraphConv(layers.RelationalGraphConv):
 
 
     def message_and_aggregate(self, graph, input, new_edge_list, new_edge_weight):
+        device = input.device  # 获取设备
         assert graph.num_relation == self.num_relation
 
         if new_edge_list is None:
@@ -271,11 +276,11 @@ class rewireGeometricRelationalGraphConv(layers.RelationalGraphConv):
         node_out = node_out * self.num_relation + relation
         if new_edge_weight is None:
             adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), graph.edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation))
+                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
         else:
             adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), new_edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation))
-        update = torch.sparse.mm(adjacency.t(), input)
+                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
+        update = torch.sparse.mm(adjacency.t(), input.to(device))
         
         if self.edge_linear:
             edge_input = graph.edge_feature.float()
