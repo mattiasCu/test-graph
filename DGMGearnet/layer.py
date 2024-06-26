@@ -11,9 +11,9 @@ import torch.nn.functional as F
 
 
 # 可rewire的关系图神经网络
-class relationalGraph(layers. MessagePassingBase):
-    eps = 1e-10
-
+@R.register("layer.relationalGraph")
+class relationalGraph(layers.MessagePassingBase):
+    
     def __init__(self, input_dim, output_dim, num_relation, edge_input_dim=None, batch_norm=False, activation="relu"):
         super(relationalGraph, self).__init__()
         self.input_dim = input_dim
@@ -30,272 +30,259 @@ class relationalGraph(layers. MessagePassingBase):
         else:
             self.activation = activation
 
-        #self.self_loop = nn.Linear(input_dim, output_dim)
+        self.self_loop = nn.Linear(input_dim, output_dim)
         self.linear = nn.Linear(input_dim, output_dim)
         if edge_input_dim:
             self.edge_linear = nn.Linear(edge_input_dim, input_dim)
         else:
             self.edge_linear = None
+            
+    def trans(self, A, graph):
+    
+        Degree_inv_sqrt = torch.diag(torch.pow(torch.sum(A, dim=1), -0.5))
+        A_norm = torch.mm(torch.mm(Degree_inv_sqrt, A), Degree_inv_sqrt)
+        
+        n_rel = graph.num_relation
+        n = A_norm.size(0)
+        n_rel = n_rel.item()  # 将 n_rel 从 Tensor 转换为 int
+        assert n % n_rel == 0, "n must be divisible by n_rel"
+        
+        block_size = n // n_rel
+        
+        # 初始化一个张量来存储累加结果
+        accumulated = torch.zeros_like(A_norm[:block_size])
+        
+        # 将后面的所有块累加到第一块
+        for i in range(n_rel):
+            accumulated += A_norm[i * block_size: (i + 1) * block_size]
+        
+        # 用累加后的第一块替换原始矩阵的第一块
+        A_trans = accumulated
+    
+        return A_trans
 
-    def message_and_aggregate(self, graph, input, edge_list, edge_weight):
-        device = input.device  # 获取设备
+    def message_and_aggregate(self, graph, input, new_edge_list):
         assert graph.num_relation == self.num_relation
-
-        if edge_list is None:
-            node_in, node_out, relation = graph.edge_list.t()
-        else:
-            node_in, node_out, relation = edge_list.t()
-        node_out = node_out * self.num_relation + relation
-        if edge_weight is None:
-            degree_out = scatter_add(graph.edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
-            edge_weight = graph.edge_weight / (degree_out[node_out]+self.eps)
-        else:
+        device = input.device  # Ensure device consistency
+        
+        if new_edge_list is None:
+            node_in, node_out, relation = graph.edge_list.t().to(device)
+            node_out = node_out * self.num_relation + relation
+        
+            edge_weight = torch.ones_like(node_out)
             degree_out = scatter_add(edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
-            edge_weight = edge_weight / (degree_out[node_out]+self.eps)
-        adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
-        update = torch.sparse.mm(adjacency.t(), input.to(device))
+            degree_out = degree_out
+            edge_weight = edge_weight / degree_out[node_out]
+            adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), edge_weight,
+                                                (graph.num_node, graph.num_node * graph.num_relation))
+            update = torch.sparse.mm(adjacency.t(), input)
+        
+        else:
+            adjacency = self.trans(new_edge_list, graph).to(device)
+            update = torch.mm(adjacency.t().to(device), input.to(device))
         
         if self.edge_linear:
-            edge_input = graph.edge_feature.float()
+            edge_input = graph.edge_feature.float().to(device)
             edge_input = self.edge_linear(edge_input)
-            edge_weight = edge_weight.unsqueeze(-1)
+            edge_weight = edge_weight.unsqueeze(-1).to(device)
             edge_update = scatter_add(edge_input * edge_weight, node_out, dim=0,
                                       dim_size=graph.num_node * graph.num_relation)
             update += edge_update
 
         return update
 
-
     def combine(self, input, update):
-        output = self.linear(update)
+        # 自环特征
+        device = input.device
+        self.linear.to(device)  # Ensure the linear layers are on the correct device
+        self.self_loop.to(device)
+        input = input.repeat(self.num_relation, 1).to(device)
+        loop_update = self.self_loop(input).to(device)
+        
+        output = self.linear(update)+loop_update
         if self.batch_norm:
             output = self.batch_norm(output)
         if self.activation:
             output = self.activation(output)
         return output
     
-    def forward(self, graph, input, edge_list, edge_weight):
+    def forward(self, graph, input, new_edge_list=None):
         
         if self.gradient_checkpoint:
             update = checkpoint.checkpoint(self._message_and_aggregate, *graph.to_tensors(), input)
         else:
-            update = self.message_and_aggregate(graph, input, edge_list, edge_weight)
+            update = self.message_and_aggregate(graph, input, new_edge_list)
         output = self.combine(input, update)
         return output
     
-    
-# 计算得分
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, in_features, out_features, num_heads, temperature=0.5, dropout=0.1):
-        super(MultiHeadSelfAttention, self).__init__()
+ 
+@R.register("layer.Rewirescorelayer")
+class Rewirescorelayer(nn.Module):
+    def __init__(self, in_features, out_features, num_heads, window_size, k, temperature=0.5, dropout=0.1):
+        super(Rewirescorelayer, self).__init__()
         self.num_heads = num_heads
         self.out_features = out_features
+        self.window_size = window_size
         self.temperature = temperature
         self.dropout = nn.Dropout(dropout)
+        self.k = k
 
         self.query = nn.Linear(in_features, out_features * num_heads)
         self.key = nn.Linear(in_features, out_features * num_heads)
         self.value = nn.Linear(in_features, out_features * num_heads)
-        self.scale = torch.sqrt(torch.FloatTensor([out_features])).to(torch.device('cuda'))
-        
+        self.scale = torch.sqrt(torch.FloatTensor([out_features])).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    def forward(self, node_features, graph):
+    def get_start_end(self, current, graph):
+        segment = graph.num_nodes.repeat(graph.num_relation)
+        index = torch.cumsum(segment, dim=0)
+        
+        # Use torch.searchsorted to find the appropriate segment
+        pos = torch.searchsorted(index, current, right=True)
+
+        if pos == 0:
+            return (0, index[0].item())
+        elif pos >= len(index):
+            return (index[-1].item(), index[-1].item())
+        else:
+            return (index[pos-1].item(), index[pos].item())
+
+    def gumbel_softmax_top_k(self, logits, tau=1.0, hard=False):
+        gumbels = -torch.empty_like(logits).exponential_().log()
+        gumbels = (logits + gumbels) / tau
+
+        y_soft = F.softmax(gumbels, dim=-1)
+
+        if hard:
+            topk_indices = logits.topk(self.k, dim=-1)[1]
+            y_hard = torch.zeros_like(logits).scatter_(-1, topk_indices, 1.0)
+            y = (y_hard - y_soft).detach() + y_soft
+        else:
+            y = y_soft
+
+        return y
+
+    def forward(self, graph, node_features):
+        device = node_features.device
         num_nodes = node_features.size(0)
-        device = node_features.device 
+        half_window = self.window_size // 2
+
+        Q = self.query(node_features).view(num_nodes, self.num_heads, self.out_features)
+        K = self.key(node_features).view(num_nodes, self.num_heads, self.out_features)
+
+        output = torch.zeros(num_nodes, num_nodes, device=device)
+
+        start_end_indices = [self.get_start_end(i, graph) for i in range(num_nodes)]
+
+        # Precompute K_windows
+        K_windows_padded = torch.zeros((num_nodes, self.window_size, self.num_heads, self.out_features), device=device)
+        for i in range(num_nodes):
+            start_index, end_index = start_end_indices[i]
+            start = max(start_index, i - half_window)
+            end = min(end_index, i + half_window)
+            K_window = K[start:end]
+            K_windows_padded[i, :K_window.size(0)] = K_window
         
-        self.scale = self.scale.to(device)
 
-        # 计算查询、键和值，并为多头自注意力进行变形
-        Q = self.query(node_features).view(num_nodes, self.num_heads, self.out_features)  # [num_nodes, num_heads, out_features]
-        K = self.key(node_features).view(num_nodes, self.num_heads, self.out_features)    # [num_nodes, num_heads, out_features]
-        #V = self.value(node_features).view(num_nodes, self.num_heads, self.out_features)  # [num_nodes, num_heads, out_features]
+        scores = torch.einsum("nhd,nmhd->nhm", Q, K_windows_padded) / self.scale        # (num_nodes, num_heads, window_size), nhm
+        scores = scores / self.temperature   # nhm
 
-        # 计算相似性分数
-        scores = torch.einsum("nhd,mhd->nhm", Q, K) / self.scale  # [num_heads, num_nodes, num_nodes]
+        attention_weights = F.softmax(scores, dim=-1).mean(dim=1)   # (num_nodes, window_size)
         
-        scores = scores / self.temperature
 
-        # 计算注意力权重
-        attention_weights = F.softmax(scores, dim=-1)  # [num_heads, num_nodes, num_nodes]
-        
-        # 应用 dropout
-        attention_weights = self.dropout(attention_weights)
+        for i in range(num_nodes):
+            start_index, end_index = start_end_indices[i]
+            start = max(start_index, i - half_window)
+            end = min(end_index, i + half_window )
+            output[i, start:end] = attention_weights[i, :end-start]
 
-        # 多头结果合并
-        attention_weights = attention_weights.mean(dim=-2)  # [num_nodes, num_nodes]
+        edge_list = self.gumbel_softmax_top_k(output, self.temperature, self.k)
 
-        return attention_weights  
-    
-
-#计算rewire后的边和边权重
-class Combinedlayer(nn.Module):
-    
-    eps = 1e-10
-    
-    def __init__(self, input_dim, output_dim, num_relation, edge_input_dim, 
-                 num_heads = 8, attention_out_features = 64, temperature=0.5, dropout=0.1):
-        super(Combinedlayer, self).__init__()
-        
-        self.relational_graph = relationalGraph(input_dim, output_dim, num_relation, edge_input_dim)
-        self.attention = MultiHeadSelfAttention(output_dim, attention_out_features, num_heads, temperature, dropout)
-    
-    def split_matrix(self,matrix, num_relation):
-        # 计算每份的行数
-        rows_per_split = matrix.shape[0] // num_relation
-
-        # 分割矩阵
-        split_matrices = []
-        for i in range(num_relation):
-            start_idx = i * rows_per_split
-            end_idx = start_idx + rows_per_split
-            split_matrices.append(matrix[start_idx:end_idx])
-
-        return split_matrices
-    
-    
-    def merge_relation_matrices(self,matrix_list):
-        merged_list = []
-
-        # 遍历每个矩阵
-        for idx, matrix in enumerate(matrix_list):
-            num_rows = matrix.size(0)
-            # 创建一个形状为 [num_rows, 1] 的张量，记录矩阵索引
-            relation_idx = torch.full((num_rows, 1), idx, dtype=torch.long)
-            # 将矩阵和索引列拼接在一起
-            extended_matrix = torch.cat((matrix, relation_idx), dim=1)
-            merged_list.append(extended_matrix)
-        
-        # 将所有扩展后的矩阵合并成一个矩阵
-        merged_matrix = torch.cat(merged_list, dim=0)
-        
-        return merged_matrix
-
-    def process_list(self, tensor_list):
-        result_list = []
-        edge_weights_list = []
-
-        for matrix in tensor_list:
-            num_nodes = matrix.size(0)
-            indices_list = []
-            values_list = []
-
-            for i in range(num_nodes):
-                row = matrix[i]
-                # 找到前3个最大的数及其索引
-                sorted_indices = torch.argsort(row, descending=True)  # 从大到小排序
-                max_values = row[sorted_indices][:5]
-
-                # 检查是否有超过3个相同的最大数
-                count = (row == max_values[-1]).sum().item()
-
-                if count > 3:
-                    # 选择与当前行序号距离最近的列索引
-                    relevant_indices = sorted_indices[:count]
-                    distances = torch.abs(relevant_indices - i)
-                    closest_indices = relevant_indices[torch.argsort(distances)][:3]
-                    selected_indices = closest_indices
-                else:
-                    selected_indices = sorted_indices[:3]
-
-                # 记录当前行号、所选列号和对应的值
-                for j in selected_indices:
-                    indices_list.append([i, j.item()])
-                    values_list.append(row[j].item())
-
-            result_matrix = torch.tensor(indices_list, dtype=torch.long)
-            result_list.append(result_matrix)
-            edge_weights_list.append(torch.tensor(values_list, dtype=torch.float))
-
-        return self.merge_relation_matrices(result_list), torch.cat(edge_weights_list).view(-1, 1)
-
-    
-    def normalize_edge_weights(self,edge_weights):
-        min_weight = edge_weights.min()
-        max_weight = edge_weights.max()
-        normalized_weights = (edge_weights - min_weight) / (max_weight - min_weight + self.eps)
-        return normalized_weights
-
-    
-    def forward(self, node_features, graph, edge_list, edge_weight):
-        # Apply relational graph layer
-        relational_output = self.relational_graph(graph, node_features, edge_list, edge_weight)
-        
-        relational_output = self.split_matrix(relational_output, graph.num_relation)
-        #print("relational_output: ", len(relational_output))
-        
-        attention_output = []
-        for i in range(len(relational_output)):
-            # Apply multi-head self attention
-            output = self.attention(relational_output[i], graph)
-            attention_output.append(output)
-            
-        #print("attention_output: ", attention_output)
-        new_edge_list, new_edge_weight = self.process_list(attention_output)
-        new_edge_weight = new_edge_weight.squeeze()  # 去掉多余的维度
-        new_edge_weight = self.normalize_edge_weights(new_edge_weight)
-        
-        # 调试信息
-        #print("new_edge_list: ", new_edge_list)
-        print("new_edge_weight: ", new_edge_weight)
-        
-        
-        return new_edge_list, new_edge_weight
+        return edge_list
     
 
 # 可rewire的几何关系图卷积
-class rewireGeometricRelationalGraphConv(layers.RelationalGraphConv):
+@R.register("layer.RewireGearnet")
+class RewireGearnet(nn.Module):
     gradient_checkpoint = False
 
     def __init__(self, input_dim, output_dim, num_relation, edge_input_dim=None, batch_norm=False, activation="relu"):
-        super(rewireGeometricRelationalGraphConv, self).__init__(input_dim, output_dim, num_relation, edge_input_dim,
-                                                           batch_norm, activation)
+        super(RewireGearnet, self).__init__()
+        self.num_relation = num_relation
+        self.input_dim = input_dim
+        self.output_dim = output_dim
 
-    def aggregate(self, graph, message, new_edge_list):
+        self.linear = nn.Linear(num_relation * input_dim, output_dim)
+        self.self_loop = nn.Linear(input_dim, output_dim)
+        self.batch_norm = nn.BatchNorm1d(output_dim) if batch_norm else None
+        self.activation = getattr(F, activation) if activation else None
+        self.edge_linear = nn.Linear(edge_input_dim, output_dim) if edge_input_dim else None
+
+    def trans(self, A, graph):
+        n_rel = graph.num_relation
+        n = A.size(0)
+        n_rel = n_rel.item()  # 将 n_rel 从 Tensor 转换为 int
+        assert n % n_rel == 0, "n must be divisible by n_rel"
+        
+        block_size = n // n_rel
+        
+        # 初始化一个张量来存储累加结果
+        accumulated = torch.zeros_like(A[:block_size])
+        
+        # 将后面的所有块累加到第一块
+        for i in range(n_rel):
+            accumulated += A[i * block_size: (i + 1) * block_size]
+        
+        # 用累加后的第一块替换原始矩阵的第一块
+        A_trans = accumulated
+    
+        return A_trans
+
+    def message_and_aggregate(self, graph, input, new_edge_list=None):
         assert graph.num_relation == self.num_relation
 
-        if new_edge_list is None:
-            node_out = graph.edge_list[:, 1] * self.num_relation + graph.edge_list[:, 2]
-        else:
-            node_out = new_edge_list[:, 1] * self.num_relation + new_edge_list[:, 2]
-        edge_weight = graph.edge_weight.unsqueeze(-1)
-        update = scatter_add(message * edge_weight, node_out, dim=0, dim_size=graph.num_node * self.num_relation)
-        update = update.view(graph.num_node, self.num_relation * self.input_dim)
-
-        return update
-
-
-    def message_and_aggregate(self, graph, input, new_edge_list, new_edge_weight):
-        device = input.device  # 获取设备
-        assert graph.num_relation == self.num_relation
+        device = input.device  # Ensure device consistency
 
         if new_edge_list is None:
-            node_in, node_out, relation = graph.edge_list.t()
+            node_in, node_out, relation = graph.edge_list.t().to(device)
+            node_out = node_out * self.num_relation + relation
+            adjacency = torch.sparse_coo_tensor(
+                torch.stack([node_in, node_out]),
+                graph.edge_weight.to(device),
+                (graph.num_node, graph.num_node * graph.num_relation),
+                device=device
+            )
+            update = torch.sparse.mm(adjacency.t(), input)
         else:
-            node_in, node_out, relation = new_edge_list.t()
-        node_out = node_out * self.num_relation + relation
-        if new_edge_weight is None:
-            adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), graph.edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
-        else:
-            adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), new_edge_weight,
-                                            (graph.num_node, graph.num_node * graph.num_relation)).to(device)
-        update = torch.sparse.mm(adjacency.t(), input.to(device))
+            adjacency = self.trans(new_edge_list, graph).to(device)
+            update = torch.mm(adjacency.t(), input.to(device))
         
         if self.edge_linear:
-            edge_input = graph.edge_feature.float()
+            edge_input = graph.edge_feature.float().to(device)
             edge_input = self.edge_linear(edge_input)
-            if new_edge_weight is None:
-                edge_weight = graph.edge_weight.unsqueeze(-1)
-            else:
-                edge_weight = new_edge_weight.unsqueeze(-1)
-            edge_update = scatter_add(edge_input * edge_weight, node_out, dim=0,
-                                    dim_size=graph.num_node * graph.num_relation)
+            edge_weight = graph.edge_weight.unsqueeze(-1).to(device)
+            edge_update = scatter_add(
+                edge_input * edge_weight, node_out, dim=0,
+                dim_size=graph.num_node * graph.num_relation
+            )
             update += edge_update
             
-        return update.view(graph.num_node, self.num_relation * self.input_dim)
-    
-    def forward(self, graph, input, new_edge_list=None, new_edge_weight = None):
+        return update.view(graph.num_node, self.num_relation * self.input_dim).to(device)
+
+    def combine(self, input, update):
+        device = input.device
+        self.linear.to(device)  # Ensure the linear layers are on the correct device
+        self.self_loop.to(device)
+        if self.batch_norm:
+            self.batch_norm.to(device)
+        
+        output = self.linear(update) + self.self_loop(input)
+        if self.batch_norm:
+            output = self.batch_norm(output)
+        if self.activation:
+            output = self.activation(output)
+        return output
+
+    def forward(self, graph, input, new_edge_list=None, new_edge_weight=None):
         """
         Perform message passing over the graph(s).
 
@@ -304,8 +291,8 @@ class rewireGeometricRelationalGraphConv(layers.RelationalGraphConv):
             input (Tensor): node representations of shape :math:`(|V|, ...)`
         """
         if self.gradient_checkpoint:
-            update = checkpoint.checkpoint(self._message_and_aggregate, *graph.to_tensors(), input)
+            update = checkpoint.checkpoint(self.message_and_aggregate, graph, input)
         else:
-            update = self.message_and_aggregate(graph, input, new_edge_list, new_edge_weight)
+            update = self.message_and_aggregate(graph, input, new_edge_list)
         output = self.combine(input, update)
         return output

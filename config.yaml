@@ -13,14 +13,17 @@ dataset:
 task:
   class: MultipleBinaryClassification
   model:
-    class: DGMGearNet
+    class: DGMGearnet
     input_dim: 21
-    hidden_dims: [512, 512, 512]
+    hidden_dims: [512, 512, 512, 512, 512, 512]
+    num_relation: 7
+    num_heads: 8
+    window_size: 50
+    k: 5
     batch_norm: True
     concat_hidden: True
     short_cut: True
     readout: 'sum'
-    num_relation: 7
   graph_construction_model:
     class: GraphConstruction
     node_layers:
