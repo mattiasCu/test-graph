@@ -15,7 +15,8 @@ task:
   model:
     class: DGMGearnet
     input_dim: 21
-    hidden_dims: [512, 512, 512, 512, 512, 512]
+    hidden_dims: [512, 512, 512, 512, 512]
+    score_dim: 128
     num_relation: 7
     num_heads: 8
     window_size: 50
@@ -60,4 +61,4 @@ engine:
 metric: f1_max
 
 train:
-  num_epoch: 10
+  num_epoch: 100
