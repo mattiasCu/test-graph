@@ -9,6 +9,7 @@
             //"program": "${workspaceFolder}/script/downstream.py",
             "module": "torch.distributed.launch",
             "console": "integratedTerminal",
+            "justMyCode": false,
             "args": [
                 //"-m", "torch.distributed.launch",
                 "--nproc_per_node=2",
@@ -19,8 +20,12 @@
   
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
+                
             }
         }
     ]
 }
-  
+ 
+
+
+//nohup python -m torch.distributed.launch --nproc_per_node=2 script/downstream.py -c config.yaml --gpus [0,1]

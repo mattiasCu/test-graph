@@ -14,7 +14,7 @@ from DGMGearnet.layer import relationalGraph, Rewirescorelayer, RewireGearnet
 @R.register("models.DGMGearnet")
 class DGMGearnet(nn.Module, core.Configurable):
 
-    def __init__(self, input_dim, hidden_dims, num_relation, num_heads, window_size, k, edge_input_dim=None, num_angle_bin=None,
+    def __init__(self, input_dim, hidden_dims, score_dim, num_relation, num_heads, window_size, k, edge_input_dim=None, num_angle_bin=None,
                  short_cut=False, batch_norm=False, activation="relu", concat_hidden=False, readout="sum"):
         super(DGMGearnet, self).__init__()
 
@@ -23,6 +23,7 @@ class DGMGearnet(nn.Module, core.Configurable):
         self.input_dim = input_dim
         self.output_dim = sum(hidden_dims) if concat_hidden else hidden_dims[-1]
         self.dims = [input_dim] + list(hidden_dims)
+        self.score_dim = score_dim
         self.num_heads = num_heads
         self.window_size = window_size
         self.k = k
@@ -37,10 +38,11 @@ class DGMGearnet(nn.Module, core.Configurable):
         self.score_layers = nn.ModuleList()
         for i in range(len(self.dims) - 1):
             
-            self.score_layers.append(relationalGraph(self.dims[i], self.dims[i + 1], num_relation, edge_input_dim, 
-                                            batch_norm, activation))
+            self.score_layers.append(relationalGraph(self.dims[i], self.score_dim, num_relation, 
+                                                     edge_input_dim=None, batch_norm=False, activation="relu")) 
+
             
-            self.score_layers.append(Rewirescorelayer(self.dims[i + 1], self.dims[i + 1], self.num_heads, self.window_size, 
+            self.score_layers.append(Rewirescorelayer(self.score_dim, self.dims[i+1], self.num_heads, self.window_size, 
                                             self.k, temperature=0.5, dropout=0.1))
             
             self.layers.append(RewireGearnet(self.dims[i], self.dims[i + 1], num_relation,
@@ -95,7 +97,7 @@ class DGMGearnet(nn.Module, core.Configurable):
             
             if self.short_cut and hidden.shape == layer_input.shape:
                 hidden = hidden + layer_input
-                
+            
             if self.num_angle_bin:
                 edge_hidden = self.edge_layers[i](line_graph, edge_input)
                 edge_weight = graph.edge_weight.unsqueeze(-1)
@@ -111,6 +113,7 @@ class DGMGearnet(nn.Module, core.Configurable):
                 update = self.layers[i].activation(update)
                 hidden = hidden + update
                 edge_input = edge_hidden
+                
             if self.batch_norm:
                 hidden = self.batch_norms[i](hidden)
                 
@@ -123,8 +126,8 @@ class DGMGearnet(nn.Module, core.Configurable):
         else:
             node_feature = hiddens[-1]
         graph_feature = self.readout(graph, node_feature)
-        print("node_feature: ", node_feature.shape)
 
+        print("batch finished")
         return {
             "graph_feature": graph_feature,
             "node_feature": node_feature
