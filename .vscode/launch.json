@@ -12,10 +12,10 @@
             "justMyCode": false,
             "args": [
                 //"-m", "torch.distributed.launch",
-                "--nproc_per_node=2",
+                "--nproc_per_node=1",
                 "${workspaceFolder}/script/downstream.py",
                 "-c", "config.yaml",
-                "--gpus", "[0,1]"
+                "--gpus", "[0]"
             ],
   
             "env": {

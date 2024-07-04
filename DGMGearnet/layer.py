@@ -6,7 +6,7 @@ import torch
 
 from torchdrug.core import Registry as R
 import torch.nn.functional as F
-
+from einops import rearrange, repeat, pack, unpack
 
 
 
@@ -38,28 +38,27 @@ class relationalGraph(layers.MessagePassingBase):
             self.edge_linear = None
             
     def trans(self, A, graph):
-    
-        Degree_inv_sqrt = torch.diag(torch.pow(torch.sum(A, dim=1), -0.5))
-        A_norm = torch.mm(torch.mm(Degree_inv_sqrt, A), Degree_inv_sqrt)
-        
         n_rel = graph.num_relation
-        n = A_norm.size(0)
-        n_rel = n_rel.item()  # 将 n_rel 从 Tensor 转换为 int
-        assert n % n_rel == 0, "n must be divisible by n_rel"
-        
-        block_size = n // n_rel
-        
-        # 初始化一个张量来存储累加结果
-        accumulated = torch.zeros_like(A_norm[:block_size])
-        
-        # 将后面的所有块累加到第一块
-        for i in range(n_rel):
-            accumulated += A_norm[i * block_size: (i + 1) * block_size]
-        
-        # 用累加后的第一块替换原始矩阵的第一块
-        A_trans = accumulated
+        A = A.view(A.size(0),n_rel, A.size(1)//n_rel).permute(1, 0, 2)
+       # 初始化结果张量
+        A_norm = torch.zeros_like(A)
+
+        # 对每个 (1024, 1024) 矩阵进行处理
+        for i in range(A.size(0)):
+            # 计算度矩阵 (按行求和)
+            degree = A[i].sum(dim=1)
+            
+            # 计算度矩阵的逆平方根
+            degree_inv_sqrt = torch.pow(degree, -0.5)
+            
+            # 将度矩阵逆平方根转换为对角矩阵
+            Degree_inv_sqrt = torch.diag(degree_inv_sqrt)
+            
+            # 进行归一化操作
+            A_norm[i] = torch.mm(torch.mm(Degree_inv_sqrt, A[i]), Degree_inv_sqrt)
+        Anorm = A_norm.permute(1, 0, 2).contiguous().view(A_norm.size(1), A_norm.size(0)*A_norm.size(2))
     
-        return A_trans
+        return Anorm
 
     def message_and_aggregate(self, graph, input, new_edge_list):
         assert graph.num_relation == self.num_relation
@@ -104,116 +103,273 @@ class relationalGraph(layers.MessagePassingBase):
         return output
     
     def forward(self, graph, input, new_edge_list=None):
-        
+        device = input.device
         if self.gradient_checkpoint:
             update = checkpoint.checkpoint(self._message_and_aggregate, *graph.to_tensors(), input, new_edge_list)
         else:
-            update = self.message_and_aggregate(graph, input, new_edge_list)
+            update = self.message_and_aggregate(graph.to(device), input, new_edge_list)
         output = self.combine(input, update).view(graph.num_relation, input.size(0), -1)
         return output
     
  
 @R.register("layer.Rewirescorelayer")
 class Rewirescorelayer(nn.Module):
-    def __init__(self, in_features, out_features, num_heads, window_size, k, temperature=0.5, dropout=0.1):
+    def __init__(self, in_features, out_features, num_heads, window_size, k, temperature=0.5):
         super(Rewirescorelayer, self).__init__()
+        self.input_dim = in_features
+        self.output_dim = out_features
         self.num_heads = num_heads
-        self.out_features = out_features
         self.window_size = window_size
-        self.temperature = temperature
-        self.dropout = nn.Dropout(dropout)
         self.k = k
-        
-        self.query = nn.Linear(in_features, out_features * num_heads)
-        self.key = nn.Linear(in_features, out_features * num_heads)
+        self.temperature = temperature
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.query = nn.Linear(in_features, out_features * num_heads).to(device)
+        self.key = nn.Linear(in_features, out_features * num_heads).to(device)
         self.scale = 1 / (out_features ** 0.5)
+    
+    
+    
+    class LocalAttention(nn.Module):
+        def __init__(
+            self,
+            window_size,
+            look_backward = 1,
+            look_forward = None,
+            dim = None,
+            scale = None,
+            pad_start_position = None
+        ):
+            super().__init__()
 
-    def split_windows(self, tensor, index, window_size, device):
-        result = []
-        index_list = []
+            self.scale = scale
+
+            self.window_size = window_size
+
+            self.look_backward = look_backward
+            self.look_forward = look_forward
+            
+            self.pad_start_position = pad_start_position
+
+        def exists(self,val):
+            return val is not None
+
+        # 如果value不存在，返回d
+        def default(self,value, d):
+            return d if not self.exists(value) else value
+
+        def to(self, t):
+            return {'device': t.device, 'dtype': t.dtype}
+
+        def max_neg_value(self, tensor):
+            return -torch.finfo(tensor.dtype).max  #返回给定张量数据类型的所能表示的最大负值
+
+        def look_around(self, x, backward = 1, forward = 0, pad_value = -1, dim = 2):  #x = bk: (40, 32, 16, 64)
+            t = x.shape[1]    #获取一共有多少个窗口，这里是32
+            dims = (len(x.shape) - dim) * (0, 0)   #一个长度为 len(x.shape) - dim 的元组，每个元素为 (0, 0)；其中len(x.shape) = 4
+            padded_x = F.pad(x, (*dims, backward, forward), value = pad_value)   #在第二维度上，前面加backward个元素，后面加forward个元素 -> (40, 33, 16, 64)
+            tensors = [padded_x[:, ind:(ind + t), ...] for ind in range(forward + backward + 1)] #一个张量列表，每个张量的维度为(40, 32, 16, 64), len = 2
+            return torch.cat(tensors, dim = dim) #在第二维度上拼接 -> (40, 32, 32, 64)
+    
+        def forward(
+            self,
+            q, k,
+            mask = None,
+            input_mask = None,
+            window_size = None
+        ):
+
+            mask = self.default(mask, input_mask)
+            assert not (self.exists(window_size) and not self.use_xpos), 'cannot perform window size extrapolation if xpos is not turned on'
+            shape, pad_value, window_size, look_backward, look_forward = q.shape, -1, self.default(window_size, self.window_size), self.look_backward, self.look_forward
+            (q, packed_shape), (k, _) = map(lambda t: pack([t], '* n d'), (q, k))  #打包成[5, 8, 512, 64] -> [40, 512, 64] 
+
+
+            b, n, dim_head, device, dtype = *q.shape, q.device, q.dtype   # 40, 512, 64
+            scale = self.default(self.scale, dim_head ** -0.5)
+            assert (n % window_size) == 0, f'sequence length {n} must be divisible by window size {window_size} for local attention'
+
+            windows = n // window_size  # 512 / 16 = 32
+
+            seq = torch.arange(n, device = device)                  # 0, 1, 2, 3, ..., 511
+            b_t = rearrange(seq, '(w n) -> 1 w n', w = windows, n = window_size)    # (1, 32, 16) 排序序列变形后的矩阵
+
+            # bucketing
+
+            bq, bk = map(lambda t: rearrange(t, 'b (w n) d -> b w n d', w = windows), (q, k)) #重构：（40，512，64）->（40, 32, 16, 64）
+
+            bq = bq * scale    # (40, 32, 16, 64)
+
+            look_around_kwargs = dict(
+                backward =  look_backward,
+                forward =  look_forward,
+                pad_value = pad_value
+            )
+
+            bk = self.look_around(bk, **look_around_kwargs)      # (40, 32, 32, 64)
+    
+
+            # calculate positions for masking
+
+            bq_t = b_t
+            bq_k = self.look_around(b_t, **look_around_kwargs) # (1, 32, 32)
+
+            bq_t = rearrange(bq_t, '... i -> ... i 1')      # (1, 32, 16, 1)
+            bq_k = rearrange(bq_k, '... j -> ... 1 j')      # (1, 32, 1, 16)
+
+            pad_mask = bq_k == pad_value
+
+            sim = torch.einsum('b h i e, b h j e -> b h i j', bq, bk)  # (40, 32, 16, 64) * (40, 32, 32, 64) -> (40, 32, 16, 32)
+
+            mask_value = self.max_neg_value(sim)
+
+            sim = sim.masked_fill(pad_mask, mask_value)
+
+
+            if self.exists(mask):
+                batch = mask.shape[0]    # 5
+                assert (b % batch) == 0
+
+                h = b // mask.shape[0]  # 8
+
+                mask = rearrange(mask, '... (w n) -> (...) w n', w = windows, n = window_size)
+                mask = self.look_around(mask, **{**look_around_kwargs, 'pad_value': False})
+                mask = rearrange(mask, '... j -> ... 1 j')
+                mask = repeat(mask, 'b ... -> (b h) ...', h = h)
+
+                sim = sim.masked_fill(~mask, mask_value)
+                del mask
+                
+            indices = [self.pad_start_position[i] // window_size for i in range(len(self.pad_start_position)) if i % 2 != 0]
+            all_indices = list(range(windows))
+            remaining_indices = [idx for idx in all_indices if idx not in indices]
+            
+            # 使用剩余的索引选择元素
+            rest_sim = sim[:, remaining_indices, :, :]
+
+            # attention
+            attn = rest_sim.softmax(dim = -1)
+
+            return attn
+
+    def insert_zero_rows(self, tensor, lengths, target_lengths):
+        assert len(lengths) == len(target_lengths), "Lengths and target lengths must be of the same length."
+        
+        # 计算每个位置需要插入的零行数
+        zero_rows = [target - length for length, target in zip(lengths, target_lengths)]
+        
+        # 初始化结果列表
+        parts = []
+        mask_parts = []
         start = 0
-
-        for idx in index:
-            end = start + idx - 1
-            while start <= end:
-                if start + window_size <= end:
-                    result.append(tensor[:, start:start + window_size, :])
-                    index_list.append([start, start + window_size])
-                    start += window_size
-                else:
-                    padding_rows = window_size - (end - start + 1)
-                    restart = start - padding_rows
-                    result.append(tensor[:, restart:restart + window_size, :])
-                    index_list.append([restart, restart + window_size])
-                    start = end + 1
         
-        result_tensor = torch.stack(result, dim=1).to(device)
-        return result_tensor, index_list
-
-    def gumbel_softmax_top_k(self, logits, tau=1.0, hard=True):
-        gumbels = -torch.empty_like(logits).exponential_().log()
-        gumbels = (logits + gumbels) / tau
-
-        y_soft = F.softmax(gumbels, dim=-1)
-
-        if hard:
-            topk_indices = logits.topk(self.k, dim=-1)[1]
-            y_hard = torch.zeros_like(logits).scatter_(-1, topk_indices, 1.0)
-            y = (y_hard - y_soft).detach() + y_soft
-        else:
-            y = y_soft
-
-        return y
-
-    def windows2adjacent(self, windows, index_list, output, device):
-        # 确保所有张量在相同设备上
-        output = output.to(device)
-        windows = windows.to(device)
-
-        # 创建一个新的张量来存储更新后的输出
-        new_output = torch.zeros_like(output, device=device)
-
-        # 填充新输出张量
-        for i, index in enumerate(index_list):
-            start, end = index
-            new_output[:, start:end, start:end] = torch.clamp(new_output[:, start:end, start:end] + windows[:, i, :, :], 0, 1)
-
-        # 获取输出张量的形状
-        num_relations, num_nodes, _ = new_output.shape
+        for i, length in enumerate(lengths):
+            end = start + length
+            
+            # 原始张量部分
+            parts.append(tensor[:, start:end, :])
+            mask_parts.append(torch.ones(tensor.size(0), length, dtype=torch.bool, device=tensor.device))
+            
+            # 插入零行
+            if zero_rows[i] > 0:
+                zero_padding = torch.zeros(tensor.size(0), zero_rows[i], tensor.size(2), device=tensor.device)
+                mask_padding = torch.zeros(tensor.size(0), zero_rows[i], dtype=torch.bool, device=tensor.device)
+                parts.append(zero_padding)
+                mask_parts.append(mask_padding)
+            
+            start = end
         
-        # 创建一个新的结果张量
-        result = torch.zeros(num_relations * num_nodes, num_relations * num_nodes, device=device)
+        # 拼接所有部分
+        padded_tensor = torch.cat(parts, dim=1)
+        mask = torch.cat(mask_parts, dim=1)
+        
+        return padded_tensor, mask
 
-        # 填充结果张量
-        for i in range(num_relations):
-            result[i * num_nodes:(i + 1) * num_nodes, i * num_nodes:(i + 1) * num_nodes] = result[i * num_nodes:(i + 1) * num_nodes, i * num_nodes:(i + 1) * num_nodes] + new_output[i]
 
-        return result
+    def round_up_to_nearest_k_and_a_window_size(self, lst, k):
+        pad_start_position = []
+        result_lst = [(x + k - 1) // k * k +k for x in lst]
+        for i in range(len(lst)):
+            pad_start_position.append(sum(result_lst[:i])-i*k + lst[i])
+            pad_start_position.append(sum(result_lst[:i+1])-k)
+        return result_lst, pad_start_position
 
+    def gumbel_softmax_top_k(self, logits,  top_k,  hard=False):
+            gumbels = -torch.empty_like(logits).exponential_().log()
+            gumbels = (logits + gumbels) / self.temperature
+
+            y_soft = F.softmax(gumbels, dim=-1)
+
+            if hard:
+                topk_indices = logits.topk(top_k, dim=-1)[1]
+                y_hard = torch.zeros_like(logits).scatter_(-1, topk_indices, 1.0)
+                y = (y_hard - y_soft).detach() + y_soft
+            else:
+                y = y_soft
+
+            return y
+        
+    def displace_tensor_blocks_to_rectangle(self, tensor, displacement):
+        batch_size, num_blocks, block_height, block_width = tensor.shape
+
+        # 计算新矩阵的宽度和高度
+        height = num_blocks * displacement
+        width =  (2 + num_blocks) * displacement
+
+        # 初始化新的大张量，确保其形状为 (batch_size, height, width)
+        new_tensor = torch.zeros(batch_size, height, width, device=tensor.device, dtype=tensor.dtype)
+
+        for i in range(num_blocks):
+            start_pos_height = i * displacement
+            start_pos_width = i * displacement
+            end_pos_height = start_pos_height + block_height
+            end_pos_width = start_pos_width + block_width
+
+            new_tensor[:, start_pos_height:end_pos_height, start_pos_width:end_pos_width] = tensor[:, i, :, :]
+
+        return new_tensor
+    
     def forward(self, graph, node_features):
-        device = node_features.device
-        num_relations = node_features.size(0)
-        num_nodes = node_features.size(1)
+        
+        num_relation = node_features.size(0)
         index = graph.num_nodes.tolist()
         
-        Q = self.query(node_features).view(num_relations, num_nodes, self.num_heads, self.out_features).permute(0, 2, 1, 3)
-        K = self.key(node_features).view(num_relations, num_nodes, self.num_heads, self.out_features).permute(0, 2, 1, 3)
-        Q = Q.reshape(num_relations * self.num_heads, num_nodes, self.out_features).to(device)
-        K = K.reshape(num_relations * self.num_heads, num_nodes, self.out_features).to(device)
+        target_input, pad_start_position = self.round_up_to_nearest_k_and_a_window_size(index, self.window_size)
+        padding_input, mask = self.insert_zero_rows(node_features, index, target_input)
         
-        output = torch.zeros(num_relations, num_nodes, num_nodes).to(device)
-        result = torch.zeros(num_relations * num_nodes, num_relations * num_nodes).to(device)
-       
-        Q_windows, Q_index = self.split_windows(Q, index, self.window_size, device)
-        K_windows, _ = self.split_windows(K, index, self.window_size, device)
+        Q = self.query(padding_input).view(num_relation, padding_input.size(1), self.num_heads, self.output_dim).permute(0, 2, 1, 3)                           # (num_relations, num_nodes, num_heads, out_features
+        K = self.key(padding_input).view(num_relation, padding_input.size(1), self.num_heads, self.output_dim).permute(0, 2, 1, 3)                             # (num_relations, num_nodes, num_heads, out_features)
+        Q = Q.reshape(num_relation * self.num_heads, padding_input.size(1), self.output_dim)                                                  # (num_relations*num_heads, num_nodes, out_features)
+        K = K.reshape(num_relation * self.num_heads, padding_input.size(1), self.output_dim) 
         
-        scores = torch.einsum('b h i e, b h j e -> b h i j', Q_windows, K_windows) / self.scale                                 # (num_relations*num_heads, num_windows, window_size, window_size)
-        attn = scores.softmax(dim=-1).view(num_relations, self.num_heads, -1, self.window_size, self.window_size).mean(dim=1)   # (num_relations, num_windows, window_size, window_size)
-        attn = self.gumbel_softmax_top_k(attn, tau=self.temperature, hard=True)                                                 # (num_relations, num_windows, window_size, window_size)
+        attn = self.LocalAttention(
+            dim = self.output_dim,                   # dimension of each head (you need to pass this in for relative positional encoding)
+            window_size = self.window_size,          # window size. 512 is optimal, but 256 or 128 yields good enough results
+            look_backward = 1,                  # each window looks at the window before
+            look_forward = 1,                   # for non-auto-regressive case, will default to 1, so each window looks at the window before and after it
+            pad_start_position = pad_start_position
+        ) 
         
-        result = result + self.windows2adjacent(attn, Q_index, output, device)
+        attn = attn(Q, K, mask = mask).view(num_relation, self.num_heads, -1, self.window_size, 3*self.window_size).mean(dim=1)  
+        score = self.gumbel_softmax_top_k(attn, self.k, hard=True)
         
-        return result
+        result_tensor = self.displace_tensor_blocks_to_rectangle(score, self.window_size)
+        result_tensor = result_tensor[:, :, 10:-10]
+        indice = [pad_start_position[i] for i in range(len(pad_start_position)) if i % 2 == 0]
+        indices = []
+
+        for num in indice:
+            next_multiple_of_10 = ((num + 9) // 10) * 10  # 计算向上取10的倍数
+            sequence = range(num, next_multiple_of_10)  # 生成序列
+            indices.extend(sequence)  # 直接将序列中的元素添加到结果列表中
+        all_indices = list(range(result_tensor.size(1)))
+        remaining_indices = [idx for idx in all_indices if idx not in indices]
+        
+        result_tensor = result_tensor[:, remaining_indices, :]
+        result_tensor = result_tensor[:, :, remaining_indices]
+        
+        
+        return result_tensor.permute(1, 0, 2).contiguous().view(result_tensor.size(1), result_tensor.size(0)*result_tensor.size(2))
+        
 
 
 
@@ -234,57 +390,38 @@ class RewireGearnet(nn.Module):
         self.activation = getattr(F, activation) if activation else None
         self.edge_linear = nn.Linear(edge_input_dim, output_dim) if edge_input_dim else None
 
-    def trans(self, A, graph):
-        n_rel = graph.num_relation
-        n = A.size(0)
-        n_rel = n_rel.item()  # 将 n_rel 从 Tensor 转换为 int
-        assert n % n_rel == 0, "n must be divisible by n_rel"
-        
-        block_size = n // n_rel
-        
-        # 初始化一个张量来存储累加结果
-        accumulated = torch.zeros_like(A[:block_size])
-        
-        # 将后面的所有块累加到第一块
-        for i in range(n_rel):
-            accumulated += A[i * block_size: (i + 1) * block_size]
-        
-        # 用累加后的第一块替换原始矩阵的第一块
-        A_trans = accumulated
-    
-        return A_trans
-
     def message_and_aggregate(self, graph, input, new_edge_list):
         assert graph.num_relation == self.num_relation
+
         device = input.device  # Ensure device consistency
 
         if new_edge_list is None:
-            node_in, node_out, relation = graph.edge_list.t()
+            node_in, node_out, relation = graph.edge_list.t().to(device)
             node_out = node_out * self.num_relation + relation
             adjacency = torch.sparse_coo_tensor(
                 torch.stack([node_in, node_out]),
-                graph.edge_weight,
-                (graph.num_node, graph.num_node * graph.num_relation)
+                graph.edge_weight.to(device),
+                (graph.num_node, graph.num_node * graph.num_relation),
+                device=device
             )
             update = torch.sparse.mm(adjacency.t(), input)
         else:
-            adjacency = self.trans(new_edge_list, graph)
-            update = torch.mm(adjacency.t().to(device), input.to(device))
+            update = torch.mm(new_edge_list.t(), input.to(device))
         
         if self.edge_linear:
-            edge_input = graph.edge_feature.float()
+            edge_input = graph.edge_feature.float().to(device)
             edge_input = self.edge_linear(edge_input)
-            edge_weight = graph.edge_weight.unsqueeze(-1)
+            edge_weight = graph.edge_weight.unsqueeze(-1).to(device)
             edge_update = scatter_add(
                 edge_input * edge_weight, node_out, dim=0,
                 dim_size=graph.num_node * graph.num_relation
             )
             update += edge_update
             
-        return update.view(graph.num_node, self.num_relation * self.input_dim)
+        return update.view(graph.num_node, self.num_relation * self.input_dim).to(device)
 
     def combine(self, input, update):
-        device  = input.device
+        device = input.device
         self.linear.to(device)  # Ensure the linear layers are on the correct device
         self.self_loop.to(device)
         if self.batch_norm:
@@ -298,13 +435,7 @@ class RewireGearnet(nn.Module):
         return output
 
     def forward(self, graph, input, new_edge_list=None):
-        """
-        Perform message passing over the graph(s).
-
-        Parameters:
-            graph (Graph): graph(s)
-            input (Tensor): node representations of shape :math:`(|V|, ...)`
-        """
+        
         if self.gradient_checkpoint:
             update = checkpoint.checkpoint(self.message_and_aggregate, graph, input)
         else:

@@ -5,6 +5,7 @@ from torchdrug.core import Registry as R
 from torch_scatter import scatter_add
 import torch.nn.functional as F
 from torch import nn
+import time
 
 import torch
 
@@ -43,7 +44,7 @@ class DGMGearnet(nn.Module, core.Configurable):
 
             
             self.score_layers.append(Rewirescorelayer(self.score_dim, self.dims[i+1], self.num_heads, self.window_size, 
-                                            self.k, temperature=0.5, dropout=0.1))
+                                                    self.k, temperature=0.5))
             
             self.layers.append(RewireGearnet(self.dims[i], self.dims[i + 1], num_relation,
                                             edge_input_dim=None, batch_norm=False, activation="relu"))
@@ -81,6 +82,7 @@ class DGMGearnet(nn.Module, core.Configurable):
             dict with ``node_feature`` and ``graph_feature`` fields:
                 node representations of shape :math:`(|V|, d)`, graph representations of shape :math:`(n, d)`
         """
+        start = time.time()
         hiddens = []
         layer_input = input
         if self.num_angle_bin:
@@ -127,7 +129,8 @@ class DGMGearnet(nn.Module, core.Configurable):
             node_feature = hiddens[-1]
         graph_feature = self.readout(graph, node_feature)
 
-        print("batch finished")
+        end = time.time()
+        print(f"Time: {end-start}s")
         return {
             "graph_feature": graph_feature,
             "node_feature": node_feature
