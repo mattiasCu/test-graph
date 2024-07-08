@@ -137,6 +137,7 @@ class LocalAttention(Module):
         indices = [self.pad_start_position[i] // window_size for i in range(len(self.pad_start_position)) if i % 2 != 0]
         all_indices = list(range(windows))
         remaining_indices = [idx for idx in all_indices if idx not in indices]
+        
         # 使用剩余的索引选择元素
         rest_sim = sim[:, remaining_indices, :, :]
 
@@ -183,7 +184,7 @@ def round_up_to_nearest_k_and_a_window_size(lst, k):
     pad_start_position = []
     result_lst = [(x + k - 1) // k * k +k for x in lst]
     for i in range(len(lst)):
-        pad_start_position.append(sum(result_lst[:i])+lst[i])
+        pad_start_position.append(sum(result_lst[:i])-i*k + lst[i])
         pad_start_position.append(sum(result_lst[:i+1])-k)
     return result_lst, pad_start_position
 
@@ -201,14 +202,32 @@ def gumbel_softmax_top_k(logits,  top_k, tau=1.0,  hard=False):
             y = y_soft
 
         return y
+    
+def displace_tensor_blocks_to_rectangle(tensor, displacement):
+    batch_size, num_blocks, block_height, block_width = tensor.shape
 
+    # 计算新矩阵的宽度和高度
+    height = num_blocks * displacement
+    width =  (2 + num_blocks) * displacement
 
+    # 初始化新的大张量，确保其形状为 (batch_size, height, width)
+    new_tensor = torch.zeros(batch_size, height, width, device=tensor.device, dtype=tensor.dtype)
+
+    for i in range(num_blocks):
+        start_pos_height = i * displacement
+        start_pos_width = i * displacement
+        end_pos_height = start_pos_height + block_height
+        end_pos_width = start_pos_width + block_width
+
+        new_tensor[:, start_pos_height:end_pos_height, start_pos_width:end_pos_width] = tensor[:, i, :, :]
+
+    return new_tensor
 
 
 if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
-    index = [185, 415]
+    index = [15, 12, 20, 8]
     num_nodes = sum(index)
     input_dim = 128
     output_dim = 128
@@ -222,14 +241,14 @@ if __name__ == '__main__':
     
     padding_input, mask = insert_zero_rows(input, index, target_input)
 
-    query = nn.Linear(input_dim, output_dim * num_heads)
-    key = nn.Linear(input_dim, output_dim * num_heads)
+    query = nn.Linear(input_dim, output_dim * num_heads).to(device)
+    key = nn.Linear(input_dim, output_dim * num_heads).to(device)
     
     start1 = time.time()
-    Q = query(padding_input).view(num_relation, padding_input.size(1), num_heads, output_dim).permute(0, 2, 1, 3)
-    K = key(padding_input).view(num_relation, padding_input.size(1), num_heads, output_dim).permute(0, 2, 1, 3)
-    Q = Q.reshape(num_relation * num_heads, padding_input.size(1), output_dim)                                    # (num_relations*num_heads, num_nodes, out_features)
-    K = K.reshape(num_relation * num_heads, padding_input.size(1), output_dim)                                    # (num_relations*num_heads, num_nodes, out_features)
+    Q = query(padding_input).view(num_relation, padding_input.size(1), num_heads, output_dim).permute(0, 2, 1, 3)                           # (num_relations, num_nodes, num_heads, out_features
+    K = key(padding_input).view(num_relation, padding_input.size(1), num_heads, output_dim).permute(0, 2, 1, 3)                             # (num_relations, num_nodes, num_heads, out_features)
+    Q = Q.reshape(num_relation * num_heads, padding_input.size(1), output_dim)                                                  # (num_relations*num_heads, num_nodes, out_features)
+    K = K.reshape(num_relation * num_heads, padding_input.size(1), output_dim)                                              # (num_relations*num_heads, num_nodes, out_features)
     
     end1 = time.time()
     print(f"Time taken: {end1 - start1:.6f}s")
@@ -237,10 +256,10 @@ if __name__ == '__main__':
     
     start2 = time.time()
     attn = LocalAttention(
-        dim = output_dim,                # dimension of each head (you need to pass this in for relative positional encoding)
-        window_size = window_size,       # window size. 512 is optimal, but 256 or 128 yields good enough results
-        look_backward = 1,       # each window looks at the window before
-        look_forward = 1,        # for non-auto-regressive case, will default to 1, so each window looks at the window before and after it
+        dim = output_dim,                   # dimension of each head (you need to pass this in for relative positional encoding)
+        window_size = window_size,          # window size. 512 is optimal, but 256 or 128 yields good enough results
+        look_backward = 1,                  # each window looks at the window before
+        look_forward = 1,                   # for non-auto-regressive case, will default to 1, so each window looks at the window before and after it
         pad_start_position = pad_start_position
     )
 
@@ -251,7 +270,24 @@ if __name__ == '__main__':
     end2 = time.time()
     print(f"Time taken: {end2 - start2:.6f}s") 
     print(attn.shape)
-    print(score.shape)
     
-    sparse_tensor = score.to_sparse()
-    print(sparse_tensor.indices().shape)
+    start3 = time.time()
+    result_tensor = displace_tensor_blocks_to_rectangle(score, window_size)
+    result_tensor = result_tensor[:, :, 10:-10]
+    print(result_tensor.shape)
+    indice = [pad_start_position[i] for i in range(len(pad_start_position)) if i % 2 == 0]
+    indices = []
+
+    for num in indice:
+        next_multiple_of_10 = ((num + 9) // 10) * 10  # 计算向上取10的倍数
+        sequence = range(num, next_multiple_of_10)  # 生成序列
+        indices.extend(sequence)  # 直接将序列中的元素添加到结果列表中
+    all_indices = list(range(result_tensor.size(1)))
+    remaining_indices = [idx for idx in all_indices if idx not in indices]
+    
+    result_tensor = result_tensor[:, remaining_indices, :]
+    result_tensor = result_tensor[:, :, remaining_indices]
+    
+    end3 = time.time()
+    print(f"Time taken: {end3 - start3:.6f}s")
+    print(result_tensor.shape)

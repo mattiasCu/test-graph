@@ -28,4 +28,4 @@
  
 
 
-//nohup python -m torch.distributed.launch --nproc_per_node=2 script/downstream.py -c config.yaml --gpus [0,1]
+//nohup python -m torch.distributed.launch --nproc_per_node=2 script/downstream.py -c config.yaml --gpus [0,1] &> /home/xiaotong/scratch/protein_output/MultipleBinaryClassification/EnzymeCommission/DGMGearnet/log/newLog.out&

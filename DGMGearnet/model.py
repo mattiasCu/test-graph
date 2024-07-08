@@ -15,7 +15,7 @@ from DGMGearnet.layer import relationalGraph, Rewirescorelayer, RewireGearnet
 @R.register("models.DGMGearnet")
 class DGMGearnet(nn.Module, core.Configurable):
 
-    def __init__(self, input_dim, hidden_dims, score_dim, num_relation, num_heads, window_size, k, edge_input_dim=None, num_angle_bin=None,
+    def __init__(self, input_dim, hidden_dims, score_in_dim, score_out_dim, num_relation, num_heads, window_size, k, edge_input_dim=None, num_angle_bin=None,
                  short_cut=False, batch_norm=False, activation="relu", concat_hidden=False, readout="sum"):
         super(DGMGearnet, self).__init__()
 
@@ -24,7 +24,8 @@ class DGMGearnet(nn.Module, core.Configurable):
         self.input_dim = input_dim
         self.output_dim = sum(hidden_dims) if concat_hidden else hidden_dims[-1]
         self.dims = [input_dim] + list(hidden_dims)
-        self.score_dim = score_dim
+        self.score_in_dim = score_in_dim
+        self.score_out_dim = score_out_dim    
         self.num_heads = num_heads
         self.window_size = window_size
         self.k = k
@@ -39,12 +40,12 @@ class DGMGearnet(nn.Module, core.Configurable):
         self.score_layers = nn.ModuleList()
         for i in range(len(self.dims) - 1):
             
-            self.score_layers.append(relationalGraph(self.dims[i], self.score_dim, num_relation, 
+            self.score_layers.append(relationalGraph(self.dims[i], self.score_in_dim, num_relation, 
                                                      edge_input_dim=None, batch_norm=False, activation="relu")) 
 
             
-            self.score_layers.append(Rewirescorelayer(self.score_dim, self.dims[i+1], self.num_heads, self.window_size, 
-                                                    self.k, temperature=0.5))
+            self.score_layers.append(Rewirescorelayer(self.score_in_dim, self.score_out_dim, self.num_heads, self.window_size, 
+                                            self.k, temperature=0.5))
             
             self.layers.append(RewireGearnet(self.dims[i], self.dims[i + 1], num_relation,
                                             edge_input_dim=None, batch_norm=False, activation="relu"))
@@ -82,19 +83,28 @@ class DGMGearnet(nn.Module, core.Configurable):
             dict with ``node_feature`` and ``graph_feature`` fields:
                 node representations of shape :math:`(|V|, d)`, graph representations of shape :math:`(n, d)`
         """
-        start = time.time()
+        device = input.device
+        node_in, node_out, relation = graph.edge_list.t().to(device)
+        node_out = node_out * self.num_relation + relation
+        adjacency = torch.sparse_coo_tensor(
+            torch.stack([node_in, node_out]),
+            graph.edge_weight.to(device),
+            (graph.num_node, graph.num_node * graph.num_relation),
+            device=device
+        )
+        adjacency = adjacency.to_dense()
+        
         hiddens = []
         layer_input = input
         if self.num_angle_bin:
             line_graph = self.spatial_line_graph(graph)
             edge_input = line_graph.node_feature.float()
-
-        for i in range(len(self.layers)):
             
+        for i in range(len(self.layers)):
             
             relational_output = self.score_layers[2*i](graph, layer_input, edge_list)
             new_edge_list = self.score_layers[2*i+1](graph, relational_output)
-            
+            new_edge_list = torch.max(adjacency, new_edge_list)
             hidden = self.layers[i](graph, layer_input, new_edge_list)
             
             if self.short_cut and hidden.shape == layer_input.shape:
@@ -129,8 +139,6 @@ class DGMGearnet(nn.Module, core.Configurable):
             node_feature = hiddens[-1]
         graph_feature = self.readout(graph, node_feature)
 
-        end = time.time()
-        print(f"Time: {end-start}s")
         return {
             "graph_feature": graph_feature,
             "node_feature": node_feature
