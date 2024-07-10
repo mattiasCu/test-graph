@@ -15,7 +15,7 @@ task:
   model:
     class: DGMGearnet
     input_dim: 21
-    hidden_dims: [512, 512, 512, 512, 512]
+    hidden_dims: [512, 512, 512]
     score_in_dim: 512
     score_out_dim: 1024
     num_relation: 7

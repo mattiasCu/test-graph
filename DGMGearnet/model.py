@@ -39,14 +39,18 @@ class DGMGearnet(nn.Module, core.Configurable):
         self.layers = nn.ModuleList()
         self.score_layers = nn.ModuleList()
         for i in range(len(self.dims) - 1):
-            
-            self.score_layers.append(relationalGraph(self.dims[i], self.score_in_dim, num_relation, 
-                                                     edge_input_dim=None, batch_norm=False, activation="relu")) 
+            if i == 0:
+                self.score_layers.append(relationalGraph(self.dims[i], self.score_in_dim, num_relation, 
+                                                        edge_input_dim=None, batch_norm=False, activation="relu")) 
 
-            
+            else:
+                self.score_layers.append(relationalGraph(self.dims[i]*(num_relation+1), score_in_dim, num_relation, 
+                                                        edge_input_dim=None, batch_norm=False, activation="relu")) 
+                    
             self.score_layers.append(Rewirescorelayer(self.score_in_dim, self.score_out_dim, self.num_heads, self.window_size, 
                                             self.k, temperature=0.5))
             
+
             self.layers.append(RewireGearnet(self.dims[i], self.dims[i + 1], num_relation,
                                             edge_input_dim=None, batch_norm=False, activation="relu"))
         
@@ -96,13 +100,14 @@ class DGMGearnet(nn.Module, core.Configurable):
         
         hiddens = []
         layer_input = input
+        score_layer_input = input
         if self.num_angle_bin:
             line_graph = self.spatial_line_graph(graph)
             edge_input = line_graph.node_feature.float()
             
         for i in range(len(self.layers)):
             
-            relational_output = self.score_layers[2*i](graph, layer_input, edge_list)
+            relational_output = self.score_layers[2*i](graph, score_layer_input, edge_list)
             new_edge_list = self.score_layers[2*i+1](graph, relational_output)
             new_edge_list = torch.max(adjacency, new_edge_list)
             hidden = self.layers[i](graph, layer_input, new_edge_list)
@@ -130,6 +135,7 @@ class DGMGearnet(nn.Module, core.Configurable):
                 hidden = self.batch_norms[i](hidden)
                 
             hiddens.append(hidden)
+            score_layer_input = torch.cat([hidden, relational_output.view(hidden.size(0), self.num_relation*hidden.size(-1))], dim=-1)
             layer_input = hidden
             edge_list = new_edge_list
 
