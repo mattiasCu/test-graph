@@ -9,6 +9,90 @@ import torch.nn.functional as F
 from einops import rearrange, repeat, pack, unpack
 
 
+class relationalGraphConv(layers.MessagePassingBase):
+    
+    eps = 1e-10
+
+    def __init__(self, input_dim, output_dim, num_relation, edge_input_dim=None, batch_norm=False, activation="relu"):
+        super(relationalGraphConv, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_relation = num_relation
+        self.edge_input_dim = edge_input_dim
+
+        if batch_norm:
+            self.batch_norm = nn.BatchNorm1d(output_dim)
+        else:
+            self.batch_norm = None
+        if isinstance(activation, str):
+            self.activation = getattr(F, activation)
+        else:
+            self.activation = activation
+
+        self.self_loop = nn.Linear(input_dim, output_dim)
+        self.linear = nn.Linear(num_relation * input_dim, output_dim)
+        if edge_input_dim:
+            self.edge_linear = nn.Linear(edge_input_dim, input_dim)
+        else:
+            self.edge_linear = None
+
+
+    def message_and_aggregate(self, graph, input, new_edge_list):
+        assert graph.num_relation == self.num_relation
+        device = input.device  # Ensure device consistency
+        
+        if new_edge_list is None:
+            node_in, node_out, relation = graph.edge_list.t().to(device)
+            node_out = node_out * self.num_relation + relation
+        
+            degree_out = scatter_add(graph.edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
+            edge_weight = graph.edge_weight / degree_out[node_out]
+            adjacency = utils.sparse_coo_tensor(torch.stack([node_in, node_out]), edge_weight,
+                                                (graph.num_node, graph.num_node * graph.num_relation))
+            update = torch.sparse.mm(adjacency.t().to(device), input.to(device))
+        else:
+            
+            new_edge_list = new_edge_list.t().view(graph.num_relation, graph.num_node, graph.num_node).permute(1, 0, 2).reshape(graph.num_node*graph.num_relation, graph.num_node).t()
+            row, col = new_edge_list.nonzero(as_tuple=True)
+            new_edge_weight = torch.ones_like(col, dtype=torch.float32)
+            degree_out = scatter_add(new_edge_weight, col, dim_size=graph.num_node * graph.num_relation)
+            edge_weight = new_edge_weight / degree_out[col]
+            adjacency = utils.sparse_coo_tensor(torch.stack([row, col]), edge_weight,
+                                                        (graph.num_node, graph.num_node * graph.num_relation))
+            update = torch.sparse.mm(adjacency.t().to(device), input.to(device))
+        
+        if self.edge_linear:
+            edge_input = graph.edge_feature.float().to(device)
+            edge_input = self.edge_linear(edge_input)
+            edge_weight = edge_weight.unsqueeze(-1).to(device)
+            edge_update = scatter_add(edge_input * edge_weight, node_out, dim=0,
+                                      dim_size=graph.num_node * graph.num_relation)
+            update += edge_update
+
+        return update.view(input.size(0), self.num_relation * self.input_dim)                           
+
+
+    def combine(self, input, update):
+        device = input.device
+        self.linear.to(device)  # Ensure the linear layers are on the correct device
+        self.self_loop.to(device)
+        output = self.linear(update) + self.self_loop(input)
+        if self.batch_norm:
+            self.batch_norm.to(device)
+            output = self.batch_norm(output)
+        if self.activation:
+            output = self.activation(output)
+        return output
+    
+    def forward(self, graph, input, new_edge_list=None):
+        device = input.device
+        if self.gradient_checkpoint:
+            update = checkpoint.checkpoint(self._message_and_aggregate, *graph.to_tensors(), input, new_edge_list)
+        else:
+            update = self.message_and_aggregate(graph.to(device), input, new_edge_list)
+        output = self.combine(input, update)
+        return output
+
 
 # 可rewire的关系图神经网络
 @R.register("layer.relationalGraph")
@@ -36,30 +120,7 @@ class relationalGraph(layers.MessagePassingBase):
             self.edge_linear = nn.Linear(edge_input_dim, input_dim)
         else:
             self.edge_linear = None
-            
-    def trans(self, A, graph):
-        n_rel = graph.num_relation
-        A = A.view(A.size(0),n_rel, A.size(1)//n_rel).permute(1, 0, 2)
-       # 初始化结果张量
-        A_norm = torch.zeros_like(A)
-
-        # 对每个 (1024, 1024) 矩阵进行处理
-        for i in range(A.size(0)):
-            # 计算度矩阵 (按行求和)
-            degree = A[i].sum(dim=1)
-            
-            # 计算度矩阵的逆平方根
-            degree_inv_sqrt = torch.pow(degree, -0.5)
-            
-            # 将度矩阵逆平方根转换为对角矩阵
-            Degree_inv_sqrt = torch.diag(degree_inv_sqrt)
-            
-            # 进行归一化操作
-            A_norm[i] = torch.mm(torch.mm(Degree_inv_sqrt, A[i]), Degree_inv_sqrt)
-        Anorm = A_norm.permute(1, 0, 2).contiguous().view(A_norm.size(1), A_norm.size(0)*A_norm.size(2))
-    
-        return Anorm
-
+        
     def message_and_aggregate(self, graph, input, new_edge_list):
         assert graph.num_relation == self.num_relation
         device = input.device  # Ensure device consistency
@@ -74,8 +135,14 @@ class relationalGraph(layers.MessagePassingBase):
                                                 (graph.num_node, graph.num_node * graph.num_relation))
             update = torch.sparse.mm(adjacency.t().to(device), input.to(device))
         else:
-            adjacency = self.trans(new_edge_list, graph).to(device)
-            update = torch.mm(adjacency.t().to(device), input.to(device))
+            new_edge_list = new_edge_list.t().view(graph.num_relation, graph.num_node, graph.num_node).permute(1, 0, 2).reshape(graph.num_node*graph.num_relation, graph.num_node).t()
+            row, col = new_edge_list.nonzero(as_tuple=True)
+            new_edge_weight = torch.ones_like(col, dtype=torch.float32)
+            degree_out = scatter_add(new_edge_weight, col, dim_size=graph.num_node * graph.num_relation)
+            edge_weight = new_edge_weight / degree_out[col]
+            adjacency = utils.sparse_coo_tensor(torch.stack([row, col]), edge_weight,
+                                                        (graph.num_node, graph.num_node * graph.num_relation))
+            update = torch.sparse.mm(adjacency.t().to(device), input.to(device))
         
         if self.edge_linear:
             edge_input = graph.edge_feature.float().to(device)
@@ -85,7 +152,7 @@ class relationalGraph(layers.MessagePassingBase):
                                       dim_size=graph.num_node * graph.num_relation)
             update += edge_update
 
-        return update
+        return update.view(input.size(0), self.num_relation, self.input_dim).permute(1, 0, 2).reshape(self.num_relation*input.size(0), self.input_dim)
 
     def combine(self, input, update):
         # 自环特征
@@ -97,6 +164,7 @@ class relationalGraph(layers.MessagePassingBase):
         
         output = self.linear(update)+loop_update
         if self.batch_norm:
+            self.batch_norm.to(device)
             output = self.batch_norm(output)
         if self.activation:
             output = self.activation(output)
@@ -108,23 +176,47 @@ class relationalGraph(layers.MessagePassingBase):
             update = checkpoint.checkpoint(self._message_and_aggregate, *graph.to_tensors(), input, new_edge_list)
         else:
             update = self.message_and_aggregate(graph.to(device), input, new_edge_list)
-        output = self.combine(input, update).view(graph.num_relation, input.size(0), -1)
+        output = self.combine(input, update)
         return output
+
+
+R.register("layer.relationalGraphStack")
+class relationalGraphStack(nn.Module):
     
- 
+    def __init__(self, dims, num_relation, edge_input_dim=None, batch_norm=True, activation="relu"):
+        super(relationalGraphStack, self).__init__()
+        self.num_layers = len(dims) - 1
+        self.layers = nn.ModuleList()
+        for i in range(self.num_layers-1):
+            self.layers.append(relationalGraphConv(dims[i], dims[i + 1], num_relation, edge_input_dim, batch_norm, activation))
+            
+        self.layers.append(relationalGraph(dims[-2], dims[-1], num_relation, edge_input_dim, batch_norm, activation))
+            
+
+    def forward(self, graph, input, new_edge_list=None):
+        device = input.device
+        x = input
+        for layer in self.layers:
+            x = layer(graph.to(device), x, new_edge_list)         
+        return x.reshape(graph.num_relation, input.size(0), -1)
+
+
+
+#===================================================================================================================================
 @R.register("layer.Rewirescorelayer")
 class Rewirescorelayer(nn.Module):
-    def __init__(self, in_features, out_features, num_heads, window_size, k, temperature=0.5):
+    def __init__(self, in_features, out_features, num_relations,num_heads, window_size, k, temperature=0.5):
         super(Rewirescorelayer, self).__init__()
         self.input_dim = in_features
         self.output_dim = out_features
+        self.num_relations = num_relations
         self.num_heads = num_heads
         self.window_size = window_size
         self.k = k
         self.temperature = temperature
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.query = nn.Linear(in_features, out_features * num_heads).to(device)
-        self.key = nn.Linear(in_features, out_features * num_heads).to(device)
+        
+        self.query = nn.Linear(in_features, out_features * num_heads)
+        self.key = nn.Linear(in_features, out_features * num_heads)
         self.scale = 1 / (out_features ** 0.5)
     
     
@@ -135,6 +227,7 @@ class Rewirescorelayer(nn.Module):
             window_size,
             look_backward = 1,
             look_forward = None,
+            dropout = 0.,
             dim = None,
             scale = None,
             pad_start_position = None
@@ -148,7 +241,10 @@ class Rewirescorelayer(nn.Module):
             self.look_backward = look_backward
             self.look_forward = look_forward
             
+            self.dropout = nn.Dropout(dropout)
             self.pad_start_position = pad_start_position
+            
+            
 
         def exists(self,val):
             return val is not None
@@ -248,7 +344,8 @@ class Rewirescorelayer(nn.Module):
 
             # attention
             attn = rest_sim.softmax(dim = -1)
-
+            attn = self.dropout(attn)
+            
             return attn
 
     def insert_zero_rows(self, tensor, lengths, target_lengths):
@@ -330,12 +427,15 @@ class Rewirescorelayer(nn.Module):
     
     def forward(self, graph, node_features):
         
-        num_relation = node_features.size(0)
+        device = node_features.device
+        num_relation = self.num_relations
         index = graph.num_nodes.tolist()
         
         target_input, pad_start_position = self.round_up_to_nearest_k_and_a_window_size(index, self.window_size)
         padding_input, mask = self.insert_zero_rows(node_features, index, target_input)
         
+        self.query = self.query.to(device)
+        self.key = self.key.to(device)
         Q = self.query(padding_input).view(num_relation, padding_input.size(1), self.num_heads, self.output_dim).permute(0, 2, 1, 3)                           # (num_relations, num_nodes, num_heads, out_features
         K = self.key(padding_input).view(num_relation, padding_input.size(1), self.num_heads, self.output_dim).permute(0, 2, 1, 3)                             # (num_relations, num_nodes, num_heads, out_features)
         Q = Q.reshape(num_relation * self.num_heads, padding_input.size(1), self.output_dim)                                                  # (num_relations*num_heads, num_nodes, out_features)
@@ -346,33 +446,39 @@ class Rewirescorelayer(nn.Module):
             window_size = self.window_size,          # window size. 512 is optimal, but 256 or 128 yields good enough results
             look_backward = 1,                  # each window looks at the window before
             look_forward = 1,                   # for non-auto-regressive case, will default to 1, so each window looks at the window before and after it
+            dropout = 0.1,
             pad_start_position = pad_start_position
+            
         ) 
         
         attn = attn(Q, K, mask = mask).view(num_relation, self.num_heads, -1, self.window_size, 3*self.window_size).mean(dim=1)  
         score = self.gumbel_softmax_top_k(attn, self.k, hard=True)
         
         result_tensor = self.displace_tensor_blocks_to_rectangle(score, self.window_size)
-        result_tensor = result_tensor[:, :, 10:-10]
+        result_tensor = result_tensor[:, :, self.window_size:-self.window_size]
         indice = [pad_start_position[i] for i in range(len(pad_start_position)) if i % 2 == 0]
         indices = []
 
         for num in indice:
-            next_multiple_of_10 = ((num + 9) // 10) * 10  # 计算向上取10的倍数
-            sequence = range(num, next_multiple_of_10)  # 生成序列
+            next_multiple_of_window_size = ((num + self.window_size-1) // self.window_size) * self.window_size  # 计算向上取10的倍数
+            sequence = range(num, next_multiple_of_window_size)  # 生成序列
             indices.extend(sequence)  # 直接将序列中的元素添加到结果列表中
         all_indices = list(range(result_tensor.size(1)))
         remaining_indices = [idx for idx in all_indices if idx not in indices]
         
         result_tensor = result_tensor[:, remaining_indices, :]
         result_tensor = result_tensor[:, :, remaining_indices]
-        
+
         
         return result_tensor.permute(1, 0, 2).contiguous().view(result_tensor.size(1), result_tensor.size(0)*result_tensor.size(2))
         
 
+        
+
+        
 
 
+#============================================================================================================================
 # 可rewire的几何关系图卷积
 @R.register("layer.RewireGearnet")
 class RewireGearnet(nn.Module):
@@ -394,19 +500,8 @@ class RewireGearnet(nn.Module):
         assert graph.num_relation == self.num_relation
 
         device = input.device  # Ensure device consistency
-
-        if new_edge_list is None:
-            node_in, node_out, relation = graph.edge_list.t().to(device)
-            node_out = node_out * self.num_relation + relation
-            adjacency = torch.sparse_coo_tensor(
-                torch.stack([node_in, node_out]),
-                graph.edge_weight.to(device),
-                (graph.num_node, graph.num_node * graph.num_relation),
-                device=device
-            )
-            update = torch.sparse.mm(adjacency.t(), input)
-        else:
-            update = torch.mm(new_edge_list.t(), input.to(device))
+        new_edge_list = new_edge_list.t().view(graph.num_relation, graph.num_node, graph.num_node).permute(1, 0, 2).reshape(graph.num_node*graph.num_relation, graph.num_node)
+        update = torch.mm(new_edge_list, input.to(device))
         
         if self.edge_linear:
             edge_input = graph.edge_feature.float().to(device)
@@ -418,7 +513,7 @@ class RewireGearnet(nn.Module):
             )
             update += edge_update
             
-        return update.view(graph.num_node, self.num_relation * self.input_dim).to(device)
+        return update.view(input.size(0), self.num_relation * self.input_dim).to(device)
 
     def combine(self, input, update):
         device = input.device
@@ -442,3 +537,24 @@ class RewireGearnet(nn.Module):
             update = self.message_and_aggregate(graph, input, new_edge_list)
         output = self.combine(input, update)
         return output
+    
+
+
+class rewireGearNetstack(nn.Module):
+    
+    def __init__(self, dims, num_relation, edge_input_dim=None, batch_norm=True, activation="relu"):
+        super(rewireGearNetstack, self).__init__()
+        self.num_layers = len(dims) - 1
+        self.layers = nn.ModuleList()
+        
+        for i in range(self.num_layers-1):
+            self.layers.append(RewireGearnet(dims[i], dims[i+1], num_relation, edge_input_dim, batch_norm, activation))
+        
+ 
+            
+    def forward(self, graph, input, new_edge_list=None):
+        device = input.device
+        x = input
+        for layer in self.layers:
+            x = layer(graph.to(device), x, new_edge_list)       
+        return x
